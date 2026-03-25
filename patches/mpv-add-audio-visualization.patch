@@ -1,0 +1,808 @@
+--- a/audio/out/ao.h
++++ b/audio/out/ao.h
+@@ -19,6 +19,7 @@
+ #define MPLAYER_AUDIO_OUT_H
+ 
+ #include <stdbool.h>
++#include <stdint.h>
+ 
+ #include "misc/bstr.h"
+ #include "common/common.h"
+@@ -42,6 +43,25 @@
+ // data might be written again, instead of closing the AO.
+ #define PLAYER_FINAL_CHUNK 1
+ 
++#define AO_VISUALIZATION_PROPERTY "audio-visualization"
++#define AO_VISUALIZATION_VERSION 2
++#define AO_VISUALIZATION_MAX_BANDS 64
++#define AO_VISUALIZATION_MAX_PCM_FRAMES 4096
++#define AO_VISUALIZATION_MAX_PCM_CHANNELS 2
++#define AO_VISUALIZATION_MAX_WINDOW_SIZE 4096
++
++enum ao_visualization_mode {
++    AO_VISUALIZATION_MODE_BANDS = 0,
++    AO_VISUALIZATION_MODE_PCM_WINDOW = 1,
++    AO_VISUALIZATION_MODE_HYBRID = 2,
++    AO_VISUALIZATION_MODE_RAW_PCM = 3,
++};
++
++enum ao_visualization_channel_mode {
++    AO_VISUALIZATION_CHANNEL_MODE_MONO = 0,
++    AO_VISUALIZATION_CHANNEL_MODE_STEREO = 1,
++};
++
+ enum {
+     AO_EVENT_RELOAD = 1,
+     AO_EVENT_HOTPLUG = 2,
+@@ -103,6 +123,15 @@
+ double ao_get_delay(struct ao *ao);
+ void ao_reset(struct ao *ao);
+ void ao_start(struct ao *ao);
++int ao_configure_visualization(struct ao *ao, int mode, int channel_mode,
++                               int band_count, int pcm_window_size,
++                               int fft_size, int hop_size,
++                               int raw_chunk_size, int max_fps);
++int ao_read_visualization(struct ao *ao, int *mode, int *channel_mode,
++                          double *peak, double *rms, double *bands,
++                          int max_bands, double *pcm, int max_pcm,
++                          int *sample_rate, int *channels,
++                          int *frames_per_channel, uint64_t *seq);
+ void ao_set_paused(struct ao *ao, bool paused);
+ void ao_drain(struct ao *ao);
+ bool ao_is_playing(struct ao *ao);
+--- a/audio/out/internal.h
++++ b/audio/out/internal.h
+@@ -24,6 +24,13 @@
+ #include "osdep/atomic.h"
+ #include "audio/out/ao.h"
+ 
++#define AO_VISUALIZATION_DEFAULT_BAND_COUNT 16
++#define AO_VISUALIZATION_DEFAULT_PCM_WINDOW_SIZE 256
++#define AO_VISUALIZATION_DEFAULT_FFT_SIZE 1024
++#define AO_VISUALIZATION_DEFAULT_HOP_SIZE 512
++#define AO_VISUALIZATION_DEFAULT_RAW_CHUNK_SIZE 1024
++#define AO_VISUALIZATION_DEFAULT_MAX_FPS 60
++
+ /* global data used by ao.c and ao drivers */
+ struct ao {
+     int samplerate;
+@@ -68,6 +75,32 @@
+     int buffer;
+     double def_buffer;
+     struct buffer_state *buffer_state;
++
++    pthread_mutex_t visualization_lock;
++    float visualization_window[AO_VISUALIZATION_MAX_WINDOW_SIZE];
++    float visualization_window_stereo[AO_VISUALIZATION_MAX_WINDOW_SIZE *
++                                      AO_VISUALIZATION_MAX_PCM_CHANNELS];
++    double visualization_bands[AO_VISUALIZATION_MAX_BANDS];
++    double visualization_band_scales[AO_VISUALIZATION_MAX_BANDS];
++    double visualization_pcm[AO_VISUALIZATION_MAX_PCM_FRAMES *
++                             AO_VISUALIZATION_MAX_PCM_CHANNELS];
++    double visualization_peak;
++    double visualization_rms;
++    int visualization_window_pos;
++    int visualization_window_fill;
++    int visualization_pending_frames;
++    int visualization_band_count;
++    int visualization_pcm_frames;
++    int visualization_pcm_channels;
++    int visualization_mode;
++    int visualization_channel_mode;
++    int visualization_pcm_window_size;
++    int visualization_fft_size;
++    int visualization_hop_size;
++    int visualization_raw_chunk_size;
++    int visualization_max_fps;
++    double visualization_last_emit_time;
++    uint64_t visualization_seq;
+ };
+ 
+ void init_buffer_pre(struct ao *ao);
+--- a/audio/out/ao.c
++++ b/audio/out/ao.c
+@@ -31,9 +31,12 @@
+ #include "options/options.h"
+ #include "options/m_config_frontend.h"
+ #include "osdep/endian.h"
++#include "osdep/timer.h"
+ #include "common/msg.h"
+ #include "common/common.h"
+ #include "common/global.h"
++#include "player/client.h"
++#include "player/core.h"
+ 
+ extern const struct ao_driver audio_out_oss;
+ extern const struct ao_driver audio_out_audiotrack;
+@@ -176,11 +179,23 @@
+         .log = mp_log_new(ao, log, name),
+         .def_buffer = opts->audio_buffer,
+         .client_name = talloc_strdup(ao, opts->audio_client_name),
++        .visualization_band_count = AO_VISUALIZATION_DEFAULT_BAND_COUNT,
++        .visualization_pcm_channels = 1,
++        .visualization_mode = AO_VISUALIZATION_MODE_HYBRID,
++        .visualization_channel_mode = AO_VISUALIZATION_CHANNEL_MODE_MONO,
++        .visualization_pcm_window_size = AO_VISUALIZATION_DEFAULT_PCM_WINDOW_SIZE,
++        .visualization_fft_size = AO_VISUALIZATION_DEFAULT_FFT_SIZE,
++        .visualization_hop_size = AO_VISUALIZATION_DEFAULT_HOP_SIZE,
++        .visualization_raw_chunk_size = AO_VISUALIZATION_DEFAULT_RAW_CHUNK_SIZE,
++        .visualization_max_fps = AO_VISUALIZATION_DEFAULT_MAX_FPS,
+     };
++    pthread_mutex_init(&ao->visualization_lock, NULL);
+     talloc_free(opts);
+     ao->priv = m_config_group_from_desc(ao, ao->log, global, &desc, name);
+-    if (!ao->priv)
++    if (!ao->priv) {
++        pthread_mutex_destroy(&ao->visualization_lock);
+         goto error;
++    }
+     ao_set_gain(ao, 1.0f);
+     return ao;
+ error:
+@@ -613,7 +628,420 @@
+ #define MUL_GAIN_f(d, num_samples, gain)                                        \
+     for (int n = 0; n < (num_samples); n++)                                     \
+         (d)[n] = MPCLAMP(((d)[n]) * (gain), -1.0, 1.0)
++
++static int ao_visualization_clamp(int value, int fallback, int min_value,
++                                  int max_value)
++{
++    if (value <= 0)
++        value = fallback;
++    return MPCLAMP(value, min_value, max_value);
++}
++
++static void ao_visualization_clear_buffers(struct ao *ao)
++{
++    ao->visualization_window_pos = 0;
++    ao->visualization_window_fill = 0;
++    ao->visualization_pending_frames = 0;
++    ao->visualization_pcm_frames = 0;
++    ao->visualization_peak = 0.0;
++    ao->visualization_rms = 0.0;
++    ao->visualization_last_emit_time = 0.0;
++    memset(ao->visualization_window, 0, sizeof(ao->visualization_window));
++    memset(ao->visualization_window_stereo, 0,
++           sizeof(ao->visualization_window_stereo));
++    memset(ao->visualization_bands, 0, sizeof(ao->visualization_bands));
++    memset(ao->visualization_band_scales, 0,
++           sizeof(ao->visualization_band_scales));
++    memset(ao->visualization_pcm, 0, sizeof(ao->visualization_pcm));
++}
++
++static double ao_visualization_sample_to_double(int format, const void *data,
++                                                int index)
++{
++    switch (format) {
++    case AF_FORMAT_U8:
++        return (((const uint8_t *)data)[index] - 128.0) / 128.0;
++    case AF_FORMAT_S16:
++        return ((const int16_t *)data)[index] / 32768.0;
++    case AF_FORMAT_S32:
++        return ((const int32_t *)data)[index] / 2147483648.0;
++    case AF_FORMAT_FLOAT:
++        return MPCLAMP(((const float *)data)[index], -1.0, 1.0);
++    case AF_FORMAT_DOUBLE:
++        return MPCLAMP(((const double *)data)[index], -1.0, 1.0);
++    default:
++        return 0.0;
++    }
++}
++
++static void ao_visualization_notify(struct ao *ao)
++{
++    if (!ao->wakeup_ctx)
++        return;
++
++    struct MPContext *mpctx = ao->wakeup_ctx;
++    mp_client_property_change(mpctx, AO_VISUALIZATION_PROPERTY);
++    mp_wakeup_core(mpctx);
++}
++
++static void ao_visualization_calculate_levels(const float *samples,
++                                              int sample_count, double *peak,
++                                              double *rms)
++{
++    double peak_value = 0.0;
++    double rms_sum = 0.0;
++
++    if (sample_count <= 0) {
++        if (peak)
++            *peak = 0.0;
++        if (rms)
++            *rms = 0.0;
++        return;
++    }
++
++    for (int n = 0; n < sample_count; n++) {
++        double value = samples[n];
++        double abs_value = fabs(value);
++        peak_value = MPMAX(peak_value, abs_value);
++        rms_sum += value * value;
++    }
++
++    if (peak)
++        *peak = MPCLAMP(peak_value, 0.0, 1.0);
++    if (rms)
++        *rms = MPCLAMP(sqrt(rms_sum / sample_count), 0.0, 1.0);
++}
++
++static void ao_visualization_calculate_bands(struct ao *ao,
++                                             const float *samples,
++                                             int sample_count, int band_count,
++                                             double *bands_out)
++{
++    if (sample_count <= 0 || ao->samplerate <= 0 || band_count <= 0) {
++        if (band_count > 0)
++            memset(bands_out, 0, sizeof(double) * band_count);
++        return;
++    }
++
++    float windowed[AO_VISUALIZATION_MAX_WINDOW_SIZE];
++    double min_freq = 40.0;
++    double max_freq = MPMIN(16000.0, ao->samplerate * 0.45);
++    double scales[AO_VISUALIZATION_MAX_BANDS];
++
++    pthread_mutex_lock(&ao->visualization_lock);
++    memcpy(scales, ao->visualization_band_scales, sizeof(double) * band_count);
++    pthread_mutex_unlock(&ao->visualization_lock);
++
++    for (int n = 0; n < sample_count; n++) {
++        double weight = sample_count > 1
++                            ? 0.5 - 0.5 * cos((2.0 * M_PI * n) / (sample_count - 1))
++                            : 1.0;
++        windowed[n] = samples[n] * weight;
++    }
++
++    for (int band = 0; band < band_count; band++) {
++        double frac = band_count > 1 ? (double)band / (band_count - 1) : 0.0;
++        double freq = min_freq * pow(max_freq / min_freq, frac);
++        double omega = 2.0 * M_PI * freq / ao->samplerate;
++        double coeff = 2.0 * cos(omega);
++        double s_prev = 0.0;
++        double s_prev2 = 0.0;
++
++        for (int n = 0; n < sample_count; n++) {
++            double s = windowed[n] + coeff * s_prev - s_prev2;
++            s_prev2 = s_prev;
++            s_prev = s;
++        }
++
++        double power =
++            s_prev2 * s_prev2 + s_prev * s_prev - coeff * s_prev * s_prev2;
++        double magnitude = sqrt(MPMAX(power, 0.0)) / sample_count;
++        double scale = scales[band];
++
++        if (magnitude > scale) {
++            scale = magnitude;
++        } else {
++            scale = scale * 0.992 + magnitude * 0.008;
++        }
++
++        scale = MPMAX(scale, 1e-6);
++        scales[band] = scale;
++        bands_out[band] = MPCLAMP(sqrt(MPMIN(magnitude / scale, 1.0)), 0.0, 1.0);
++    }
++
++    pthread_mutex_lock(&ao->visualization_lock);
++    memcpy(ao->visualization_band_scales, scales, sizeof(double) * band_count);
++    pthread_mutex_unlock(&ao->visualization_lock);
++}
++
++int ao_configure_visualization(struct ao *ao, int mode, int channel_mode,
++                               int band_count, int pcm_window_size,
++                               int fft_size, int hop_size,
++                               int raw_chunk_size, int max_fps)
++{
++    if (!ao)
++        return -1;
++
++    int clamped_mode = MPCLAMP(mode, AO_VISUALIZATION_MODE_BANDS,
++                               AO_VISUALIZATION_MODE_RAW_PCM);
++    int clamped_channel_mode = MPCLAMP(channel_mode,
++                                       AO_VISUALIZATION_CHANNEL_MODE_MONO,
++                                       AO_VISUALIZATION_CHANNEL_MODE_STEREO);
++    int clamped_fft_size =
++        ao_visualization_clamp(fft_size, AO_VISUALIZATION_DEFAULT_FFT_SIZE,
++                               64, AO_VISUALIZATION_MAX_WINDOW_SIZE);
++    int clamped_band_count =
++        ao_visualization_clamp(band_count,
++                               AO_VISUALIZATION_DEFAULT_BAND_COUNT, 1,
++                               AO_VISUALIZATION_MAX_BANDS);
++    int clamped_pcm_window_size =
++        ao_visualization_clamp(pcm_window_size,
++                               AO_VISUALIZATION_DEFAULT_PCM_WINDOW_SIZE, 32,
++                               AO_VISUALIZATION_MAX_PCM_FRAMES);
++    int clamped_raw_chunk_size =
++        ao_visualization_clamp(raw_chunk_size,
++                               AO_VISUALIZATION_DEFAULT_RAW_CHUNK_SIZE, 32,
++                               AO_VISUALIZATION_MAX_PCM_FRAMES);
++    int clamped_hop_size =
++        ao_visualization_clamp(hop_size, AO_VISUALIZATION_DEFAULT_HOP_SIZE, 1,
++                               clamped_fft_size);
++    int clamped_max_fps =
++        max_fps < 0 ? AO_VISUALIZATION_DEFAULT_MAX_FPS
++                    : MPCLAMP(max_fps, 0, 240);
++
++    pthread_mutex_lock(&ao->visualization_lock);
++    ao->visualization_mode = clamped_mode;
++    ao->visualization_channel_mode = clamped_channel_mode;
++    ao->visualization_band_count = clamped_band_count;
++    ao->visualization_pcm_window_size = clamped_pcm_window_size;
++    ao->visualization_fft_size = clamped_fft_size;
++    ao->visualization_hop_size = clamped_hop_size;
++    ao->visualization_raw_chunk_size = clamped_raw_chunk_size;
++    ao->visualization_max_fps = clamped_max_fps;
++    ao->visualization_pcm_channels =
++        clamped_channel_mode == AO_VISUALIZATION_CHANNEL_MODE_STEREO ? 2 : 1;
++    ao_visualization_clear_buffers(ao);
++    pthread_mutex_unlock(&ao->visualization_lock);
++
++    return 0;
++}
++
++static void ao_visualization_process_data(struct ao *ao, void **data,
++                                          int num_samples)
++{
++    int input_channels = ao->channels.num;
++    if (input_channels <= 0 || num_samples <= 0)
++        return;
+ 
++    int format = af_fmt_from_planar(ao->format);
++    switch (format) {
++    case AF_FORMAT_U8:
++    case AF_FORMAT_S16:
++    case AF_FORMAT_S32:
++    case AF_FORMAT_FLOAT:
++    case AF_FORMAT_DOUBLE:
++        break;
++    default:
++        return;
++    }
++
++    bool planar = af_fmt_is_planar(ao->format);
++    float analysis_samples[AO_VISUALIZATION_MAX_WINDOW_SIZE];
++    float pcm_samples[AO_VISUALIZATION_MAX_PCM_FRAMES *
++                      AO_VISUALIZATION_MAX_PCM_CHANNELS];
++    double band_values[AO_VISUALIZATION_MAX_BANDS] = {0};
++    double peak = 0.0;
++    double rms = 0.0;
++    int mode = AO_VISUALIZATION_MODE_HYBRID;
++    int channel_mode = AO_VISUALIZATION_CHANNEL_MODE_MONO;
++    int band_count = 0;
++    int analysis_frames = 0;
++    int pcm_frames = 0;
++    int pcm_channels = 1;
++    int required_frames = 0;
++    int step_frames = 1;
++    bool emit_bands = false;
++    bool emit_pcm = false;
++    bool should_emit = false;
++    double now = mp_time_sec();
++
++    pthread_mutex_lock(&ao->visualization_lock);
++    for (int sample = 0; sample < num_samples; sample++) {
++        double mixed = 0.0;
++        double left = 0.0;
++        double right = 0.0;
++        for (int channel = 0; channel < input_channels; channel++) {
++            const void *plane = planar ? data[channel] : data[0];
++            int index = planar ? sample : sample * input_channels + channel;
++            double value =
++                ao_visualization_sample_to_double(format, plane, index);
++            if (channel == 0)
++                left = value;
++            if (channel == 1)
++                right = value;
++            mixed += value;
++        }
++        mixed /= input_channels;
++        if (input_channels == 1)
++            right = left;
++
++        ao->visualization_window[ao->visualization_window_pos] = mixed;
++        ao->visualization_window_stereo
++            [ao->visualization_window_pos * AO_VISUALIZATION_MAX_PCM_CHANNELS] =
++                left;
++        ao->visualization_window_stereo
++            [ao->visualization_window_pos * AO_VISUALIZATION_MAX_PCM_CHANNELS + 1] =
++                right;
++        ao->visualization_window_pos =
++            (ao->visualization_window_pos + 1) % AO_VISUALIZATION_MAX_WINDOW_SIZE;
++        if (ao->visualization_window_fill < AO_VISUALIZATION_MAX_WINDOW_SIZE)
++            ao->visualization_window_fill++;
++        ao->visualization_pending_frames++;
++    }
++
++    mode = ao->visualization_mode;
++    channel_mode = ao->visualization_channel_mode;
++    band_count = ao->visualization_band_count;
++    emit_bands = mode == AO_VISUALIZATION_MODE_BANDS ||
++                 mode == AO_VISUALIZATION_MODE_HYBRID;
++    emit_pcm = mode == AO_VISUALIZATION_MODE_PCM_WINDOW ||
++               mode == AO_VISUALIZATION_MODE_HYBRID ||
++               mode == AO_VISUALIZATION_MODE_RAW_PCM;
++    analysis_frames = emit_bands ? ao->visualization_fft_size
++                                 : mode == AO_VISUALIZATION_MODE_RAW_PCM
++                                       ? ao->visualization_raw_chunk_size
++                                       : ao->visualization_pcm_window_size;
++    pcm_frames = emit_pcm ? (mode == AO_VISUALIZATION_MODE_RAW_PCM
++                                 ? ao->visualization_raw_chunk_size
++                                 : ao->visualization_pcm_window_size)
++                          : 0;
++    pcm_channels = channel_mode == AO_VISUALIZATION_CHANNEL_MODE_STEREO ? 2 : 1;
++    required_frames = emit_bands ? ao->visualization_fft_size : pcm_frames;
++    if (emit_pcm)
++        required_frames = MPMAX(required_frames, pcm_frames);
++    step_frames = mode == AO_VISUALIZATION_MODE_RAW_PCM
++                      ? ao->visualization_raw_chunk_size
++                      : ao->visualization_hop_size;
++    step_frames = MPMAX(step_frames, 1);
++
++    double min_interval = ao->visualization_max_fps > 0
++                              ? 1.0 / ao->visualization_max_fps
++                              : 0.0;
++    bool interval_ready = min_interval <= 0.0 ||
++                          now - ao->visualization_last_emit_time >= min_interval;
++
++    if (required_frames > 0 &&
++        ao->visualization_window_fill >= required_frames &&
++        ao->visualization_pending_frames >= step_frames && interval_ready)
++    {
++        if (analysis_frames > 0) {
++            int start = (ao->visualization_window_pos - analysis_frames +
++                         AO_VISUALIZATION_MAX_WINDOW_SIZE) %
++                        AO_VISUALIZATION_MAX_WINDOW_SIZE;
++            for (int n = 0; n < analysis_frames; n++) {
++                int src = (start + n) % AO_VISUALIZATION_MAX_WINDOW_SIZE;
++                analysis_samples[n] = ao->visualization_window[src];
++            }
++        }
++
++        if (emit_pcm && pcm_frames > 0) {
++            int start = (ao->visualization_window_pos - pcm_frames +
++                         AO_VISUALIZATION_MAX_WINDOW_SIZE) %
++                        AO_VISUALIZATION_MAX_WINDOW_SIZE;
++            for (int n = 0; n < pcm_frames; n++) {
++                int src = (start + n) % AO_VISUALIZATION_MAX_WINDOW_SIZE;
++                if (pcm_channels == 1) {
++                    pcm_samples[n] = ao->visualization_window[src];
++                } else {
++                    pcm_samples[n * 2] = ao->visualization_window_stereo
++                        [src * AO_VISUALIZATION_MAX_PCM_CHANNELS];
++                    pcm_samples[n * 2 + 1] = ao->visualization_window_stereo
++                        [src * AO_VISUALIZATION_MAX_PCM_CHANNELS + 1];
++                }
++            }
++        }
++
++        ao->visualization_pending_frames %= step_frames;
++        ao->visualization_last_emit_time = now;
++        should_emit = true;
++    }
++    pthread_mutex_unlock(&ao->visualization_lock);
++
++    if (!should_emit)
++        return;
++
++    ao_visualization_calculate_levels(analysis_samples, analysis_frames,
++                                      &peak, &rms);
++    if (emit_bands && band_count > 0) {
++        ao_visualization_calculate_bands(ao, analysis_samples, analysis_frames,
++                                         band_count, band_values);
++    }
++
++    pthread_mutex_lock(&ao->visualization_lock);
++    ao->visualization_peak = peak;
++    ao->visualization_rms = rms;
++    ao->visualization_pcm_frames = emit_pcm ? pcm_frames : 0;
++    ao->visualization_pcm_channels = pcm_channels;
++    if (emit_bands) {
++        memcpy(ao->visualization_bands, band_values,
++               sizeof(double) * band_count);
++    } else {
++        memset(ao->visualization_bands, 0, sizeof(ao->visualization_bands));
++    }
++    if (emit_pcm) {
++        int pcm_values = pcm_frames * pcm_channels;
++        for (int n = 0; n < pcm_values; n++)
++            ao->visualization_pcm[n] = MPCLAMP(pcm_samples[n], -1.0, 1.0);
++    } else {
++        memset(ao->visualization_pcm, 0, sizeof(ao->visualization_pcm));
++    }
++    ao->visualization_seq += 1;
++    pthread_mutex_unlock(&ao->visualization_lock);
++
++    ao_visualization_notify(ao);
++}
++
++int ao_read_visualization(struct ao *ao, int *mode, int *channel_mode,
++                          double *peak, double *rms, double *bands,
++                          int max_bands, double *pcm, int max_pcm,
++                          int *sample_rate, int *channels,
++                          int *frames_per_channel, uint64_t *seq)
++{
++    if (!ao)
++        return 0;
++
++    pthread_mutex_lock(&ao->visualization_lock);
++    bool has_bands = ao->visualization_mode == AO_VISUALIZATION_MODE_BANDS ||
++                     ao->visualization_mode == AO_VISUALIZATION_MODE_HYBRID;
++    int band_count = has_bands ? ao->visualization_band_count : 0;
++    int clamped_bands = MPMIN(max_bands, band_count);
++    int pcm_values = MPMIN(max_pcm, ao->visualization_pcm_frames *
++                                    ao->visualization_pcm_channels);
++    if (mode)
++        *mode = ao->visualization_mode;
++    if (channel_mode)
++        *channel_mode = ao->visualization_channel_mode;
++    if (peak)
++        *peak = MPCLAMP(ao->visualization_peak, 0.0, 1.0);
++    if (rms)
++        *rms = MPCLAMP(ao->visualization_rms, 0.0, 1.0);
++    if (bands && clamped_bands > 0)
++        memcpy(bands, ao->visualization_bands, sizeof(double) * clamped_bands);
++    if (pcm && pcm_values > 0)
++        memcpy(pcm, ao->visualization_pcm, sizeof(double) * pcm_values);
++    if (sample_rate)
++        *sample_rate = ao->samplerate;
++    if (channels)
++        *channels = ao->visualization_pcm_channels;
++    if (frames_per_channel)
++        *frames_per_channel = ao->visualization_pcm_frames;
++    if (seq)
++        *seq = ao->visualization_seq;
++    pthread_mutex_unlock(&ao->visualization_lock);
++
++    return clamped_bands;
++}
++
+ static void process_plane(struct ao *ao, void *data, int num_samples)
+ {
+     float gain = atomic_load_explicit(&ao->gain, memory_order_relaxed);
+@@ -643,6 +1071,8 @@
+ 
+ void ao_post_process_data(struct ao *ao, void **data, int num_samples)
+ {
++    ao_visualization_process_data(ao, data, num_samples);
++
+     bool planar = af_fmt_is_planar(ao->format);
+     int planes = planar ? ao->channels.num : 1;
+     int plane_samples = num_samples * (planar ? 1: ao->channels.num);
+--- a/audio/out/buffer.c
++++ b/audio/out/buffer.c
+@@ -16,6 +16,7 @@
+  */
+ 
+ #include <stddef.h>
++#include <string.h>
+ #include <pthread.h>
+ #include <inttypes.h>
+ #include <math.h>
+@@ -320,6 +321,23 @@
+ 
+     if (wakeup)
+         ao_wakeup_playthread(ao);
++
++    pthread_mutex_lock(&ao->visualization_lock);
++    ao->visualization_window_pos = 0;
++    ao->visualization_window_fill = 0;
++    ao->visualization_pending_frames = 0;
++    ao->visualization_pcm_frames = 0;
++    ao->visualization_peak = 0.0;
++    ao->visualization_rms = 0.0;
++    ao->visualization_last_emit_time = 0.0;
++    memset(ao->visualization_window, 0, sizeof(ao->visualization_window));
++    memset(ao->visualization_window_stereo, 0,
++           sizeof(ao->visualization_window_stereo));
++    memset(ao->visualization_bands, 0, sizeof(ao->visualization_bands));
++    memset(ao->visualization_band_scales, 0,
++           sizeof(ao->visualization_band_scales));
++    memset(ao->visualization_pcm, 0, sizeof(ao->visualization_pcm));
++    pthread_mutex_unlock(&ao->visualization_lock);
+ }
+ 
+ // Initiate playback. This moves from the stop/underrun state to actually
+@@ -486,6 +504,7 @@
+         pthread_mutex_destroy(&p->pt_lock);
+     }
+ 
++    pthread_mutex_destroy(&ao->visualization_lock);
+     talloc_free(ao);
+ }
+ 
+--- a/player/command.c
++++ b/player/command.c
+@@ -1752,6 +1752,31 @@
+     MPContext *mpctx = ctx;
+     return m_property_strdup_ro(action, arg,
+                                     mpctx->ao ? ao_get_name(mpctx->ao) : NULL);
++}
++
++static int mp_property_audio_visualization(void *ctx, struct m_property *prop,
++                                           int action, void *arg)
++{
++    MPContext *mpctx = ctx;
++    if (!mpctx->ao)
++        return M_PROPERTY_UNAVAILABLE;
++
++    switch (action) {
++    case M_PROPERTY_GET_TYPE:
++        *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_NODE};
++        return M_PROPERTY_OK;
++    case M_PROPERTY_GET: {
++        uint64_t seq = 0;
++        ao_read_visualization(mpctx->ao, NULL, NULL, NULL, NULL, NULL, 0, NULL,
++                              0, NULL, NULL, NULL, &seq);
++
++        struct mpv_node *root = arg;
++        node_init(root, MPV_FORMAT_NODE_MAP, NULL);
++        node_map_add_int64(root, "seq", seq);
++        return M_PROPERTY_OK;
++    }
++    }
++    return M_PROPERTY_NOT_IMPLEMENTED;
+ }
+ 
+ /// Audio delay (RW)
+@@ -3849,6 +3874,7 @@
+     {"audio-params", mp_property_audio_params},
+     {"audio-out-params", mp_property_audio_out_params},
+     {"aid", property_switch_track, .priv = (void *)(const int[]){0, STREAM_AUDIO}},
++    {AO_VISUALIZATION_PROPERTY, mp_property_audio_visualization},
+     {"audio-device", mp_property_audio_device},
+     {"audio-device-list", mp_property_audio_devices},
+     {"current-ao", mp_property_ao},
+--- a/libmpv/client.h
++++ b/libmpv/client.h
+@@ -415,8 +415,53 @@
+  * @return The client ID.
+  */
+ MPV_EXPORT int64_t mpv_client_id(mpv_handle *ctx);
++
++enum mpv_audio_visualization_mode {
++    MPV_AUDIO_VISUALIZATION_MODE_BANDS = 0,
++    MPV_AUDIO_VISUALIZATION_MODE_PCM_WINDOW = 1,
++    MPV_AUDIO_VISUALIZATION_MODE_HYBRID = 2,
++    MPV_AUDIO_VISUALIZATION_MODE_RAW_PCM = 3,
++};
++
++enum mpv_audio_visualization_channel_mode {
++    MPV_AUDIO_VISUALIZATION_CHANNEL_MODE_MONO = 0,
++    MPV_AUDIO_VISUALIZATION_CHANNEL_MODE_STEREO = 1,
++};
+ 
+ /**
++ * Configure the native audio visualization stream attached to the current
++ * audio output.
++ *
++ * This function is intended to be paired with mpv_audio_visualization_read().
++ * It mutates the currently active audio output pipeline. If no audio output is
++ * active yet, MPV_ERROR_PROPERTY_UNAVAILABLE is returned and the caller should
++ * try again once audio playback is initialized.
++ *
++ * @return 0 on success, or a negative mpv_error on failure.
++ */
++MPV_EXPORT int mpv_audio_visualization_configure(
++    mpv_handle *ctx, int mode, int channel_mode, int band_count,
++    int pcm_window_size, int fft_size, int hop_size, int raw_chunk_size,
++    int max_fps);
++
++/**
++ * Read the latest audio visualization frame from the audio output pipeline.
++ *
++ * New frames are announced through the normal libmpv property/event wakeup
++ * path by observing the "audio-visualization" property. The property payload is
++ * intentionally lightweight, while the actual visualization payload is read
++ * through this function.
++ *
++ * @return The number of band values written on success, or a negative
++ *         mpv_error on failure.
++ */
++MPV_EXPORT int mpv_audio_visualization_read(
++    mpv_handle *ctx, int max_bands, int max_pcm, int *version, int *mode,
++    int *channel_mode, uint64_t *seq, double *pts_seconds, double *peak,
++    double *rms, int *sample_rate, int *channels, int *frames_per_channel,
++    double *bands, double *pcm);
++
++/**
+  * Create a new mpv instance and an associated client API handle to control
+  * the mpv instance. This instance is in a pre-initialized state,
+  * and needs to be initialized to be actually used with most other API
+--- a/libmpv/mpv.def
++++ b/libmpv/mpv.def
+@@ -2,6 +2,8 @@
+ mpv_client_api_version
+ mpv_client_id
+ mpv_client_name
++mpv_audio_visualization_configure
++mpv_audio_visualization_read
+ mpv_command
+ mpv_command_async
+ mpv_command_node
+--- a/player/client.c
++++ b/player/client.c
+@@ -29,6 +29,7 @@
+ #include "common/global.h"
+ #include "input/input.h"
+ #include "input/cmd.h"
++#include "audio/out/ao.h"
+ #include "misc/ctype.h"
+ #include "misc/dispatch.h"
+ #include "misc/node.h"
+@@ -330,6 +331,75 @@
+ int64_t mpv_client_id(mpv_handle *ctx)
+ {
+     return ctx->id;
++}
++
++static void lock_core(mpv_handle *ctx);
++static void unlock_core(mpv_handle *ctx);
++
++MPV_EXPORT int mpv_audio_visualization_configure(
++    mpv_handle *ctx, int mode, int channel_mode, int band_count,
++    int pcm_window_size, int fft_size, int hop_size, int raw_chunk_size,
++    int max_fps)
++{
++    if (!ctx)
++        return MPV_ERROR_INVALID_PARAMETER;
++
++    switch (mode) {
++    case MPV_AUDIO_VISUALIZATION_MODE_BANDS:
++    case MPV_AUDIO_VISUALIZATION_MODE_PCM_WINDOW:
++    case MPV_AUDIO_VISUALIZATION_MODE_HYBRID:
++    case MPV_AUDIO_VISUALIZATION_MODE_RAW_PCM:
++        break;
++    default:
++        return MPV_ERROR_INVALID_PARAMETER;
++    }
++
++    switch (channel_mode) {
++    case MPV_AUDIO_VISUALIZATION_CHANNEL_MODE_MONO:
++    case MPV_AUDIO_VISUALIZATION_CHANNEL_MODE_STEREO:
++        break;
++    default:
++        return MPV_ERROR_INVALID_PARAMETER;
++    }
++
++    int result = MPV_ERROR_PROPERTY_UNAVAILABLE;
++    lock_core(ctx);
++    if (ctx->mpctx->ao) {
++        result = ao_configure_visualization(
++            ctx->mpctx->ao, mode, channel_mode, band_count, pcm_window_size,
++            fft_size, hop_size, raw_chunk_size, max_fps);
++    }
++    unlock_core(ctx);
++
++    return result;
++}
++
++MPV_EXPORT int mpv_audio_visualization_read(
++    mpv_handle *ctx, int max_bands, int max_pcm, int *version, int *mode,
++    int *channel_mode, uint64_t *seq, double *pts_seconds, double *peak,
++    double *rms, int *sample_rate, int *channels, int *frames_per_channel,
++    double *bands, double *pcm)
++{
++    if (!ctx || max_bands < 0 || max_pcm < 0)
++        return MPV_ERROR_INVALID_PARAMETER;
++
++    int result = MPV_ERROR_PROPERTY_UNAVAILABLE;
++    lock_core(ctx);
++    if (ctx->mpctx->ao) {
++        if (version)
++            *version = AO_VISUALIZATION_VERSION;
++        result = ao_read_visualization(ctx->mpctx->ao, mode, channel_mode, peak,
++                                       rms, bands, max_bands, pcm, max_pcm,
++                                       sample_rate, channels, frames_per_channel,
++                                       seq);
++        if (pts_seconds) {
++            double pts = playing_audio_pts(ctx->mpctx);
++            *pts_seconds = pts == MP_NOPTS_VALUE ? NAN : pts;
++        }
++    }
++    unlock_core(ctx);
++
++    return result;
+ }
+ 
+ struct mp_log *mp_client_get_log(struct mpv_handle *ctx)
